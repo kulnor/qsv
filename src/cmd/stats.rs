@@ -160,6 +160,10 @@ stats options:
     --typesonly               Infer data types only and do not compute statistics.
                               Note that if you want to infer dates and boolean types, you'll
                               still need to use the --infer-dates & --infer-boolean options.
+    --subtype <list>          Infer data subtypes. <list> is a comma-separated list of subtype
+                              systems to use. Currently supported: 'xsd'.
+                              'xsd' infers XSD data subtypes (byte, short, int, long, decimal).
+                              This adds a 'subtype_xsd' column to the output.
 
                               BOOLEAN INFERENCING:
     --infer-boolean           Infer boolean data type. This automatically enables
@@ -374,6 +378,7 @@ pub struct Args {
     pub flag_memcheck:         bool,
     pub flag_vis_whitespace:   bool,
     pub flag_dataset_stats:    bool,
+    pub flag_subtype:          Option<String>,
 }
 
 // this struct is used to serialize/deserialize the stats to
@@ -407,6 +412,7 @@ struct StatsArgs {
     date_generated:       String,
     compute_duration_ms:  u64,
     qsv_version:          String,
+    flag_subtype:         String,
 }
 
 #[cfg(target_endian = "little")]
@@ -464,6 +470,10 @@ impl StatsArgs {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
+            flag_subtype:         value["flag_subtype"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         })
     }
 }
@@ -475,6 +485,8 @@ pub struct StatsData {
     // so we escape it as r#type
     // we need to do this for serde to work
     pub r#type:               String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype_xsd:          Option<String>,
     #[serde(default)]
     pub is_ascii:             bool,
     pub sum:                  Option<f64>,
@@ -530,6 +542,7 @@ pub enum JsonTypes {
 pub static STATSDATA_TYPES_MAP: phf::Map<&'static str, JsonTypes> = phf_map! {
     "field" => JsonTypes::String,
     "type" => JsonTypes::String,
+    "subtype_xsd" => JsonTypes::String,
     "is_ascii" => JsonTypes::Bool,
     "sum" => JsonTypes::Float,
     "min" => JsonTypes::String,
@@ -731,6 +744,7 @@ fn parse_boolean_patterns(boolean_patterns: &str) -> CliResult<Vec<BooleanPatter
     Ok(patterns)
 }
 
+
 /// Main entry point for the stats command.
 ///
 /// This function orchestrates the entire CSV statistics computation process, including
@@ -842,6 +856,7 @@ pub fn run(argv: &[&str]) -> CliResult<()> {
         // so cached stats are automatically invalidated
         // when the qsv version changes
         qsv_version:          env!("CARGO_PKG_VERSION").to_string(),
+        flag_subtype:         format!("{:?}", args.flag_subtype),
     };
 
     // create a temporary file to store the <FILESTEM>.stats.csv file
@@ -1547,6 +1562,7 @@ impl Args {
         let round_places = self.flag_round;
         let infer_boolean = self.flag_infer_boolean;
         let dataset_stats = self.flag_dataset_stats;
+        let flag_subtype = self.flag_subtype.clone();
         let mut records = Vec::with_capacity(stats.len());
         records.extend(repeat_n(csv::StringRecord::new(), stats.len()));
         let pool = ThreadPool::new(util::njobs(self.flag_jobs));
@@ -1554,11 +1570,22 @@ impl Args {
         for mut stat in stats {
             let (send, recv) = crossbeam_channel::bounded(0);
             results.push(recv);
+            let flag_subtype = flag_subtype.clone();
             pool.execute(move || {
                 // safety: this will only return an Error if the channel has been disconnected
                 // which will not happen in this case
-                send.send(stat.to_record(round_places, infer_boolean, visualize_ws, dataset_stats))
-                    .unwrap();
+                let subtype_xsd = flag_subtype
+                    .as_ref()
+                    .map_or(false, |s| s.to_lowercase().contains("xsd"));
+
+                send.send(stat.to_record(
+                    round_places,
+                    infer_boolean,
+                    visualize_ws,
+                    dataset_stats,
+                    subtype_xsd,
+                ))
+                .unwrap();
             });
         }
         for (i, recv) in results.into_iter().enumerate() {
@@ -1747,13 +1774,18 @@ impl Args {
     /// * **Bulk Initialization**: Uses `repeat_n` for efficient object creation
     #[inline]
     fn new_stats(&self, record_len: usize) -> Vec<Stats> {
+        let subtype_xsd = self
+            .flag_subtype
+            .as_ref()
+            .map_or(false, |s| s.to_lowercase().contains("xsd"));
+
         let mut stats: Vec<Stats> = Vec::with_capacity(record_len);
         stats.extend(repeat_n(
             Stats::new(WhichStats {
                 include_nulls:   self.flag_nulls,
-                sum:             !self.flag_typesonly || self.flag_infer_boolean,
-                range:           !self.flag_typesonly || self.flag_infer_boolean,
-                dist:            !self.flag_typesonly || self.flag_infer_boolean,
+                sum:             !self.flag_typesonly || self.flag_infer_boolean || subtype_xsd,
+                range:           !self.flag_typesonly || self.flag_infer_boolean || subtype_xsd,
+                dist:            !self.flag_typesonly || self.flag_infer_boolean || subtype_xsd,
                 cardinality:     self.flag_everything || self.flag_cardinality,
                 median:          !self.flag_everything && self.flag_median && !self.flag_quartiles,
                 mad:             self.flag_everything || self.flag_mad,
@@ -1762,6 +1794,7 @@ impl Args {
                 typesonly:       self.flag_typesonly,
                 percentiles:     self.flag_everything || self.flag_percentiles,
                 percentile_list: self.flag_percentile_list.clone(),
+                subtype_xsd,
             }),
             record_len,
         ));
@@ -1769,8 +1802,17 @@ impl Args {
     }
 
     pub fn stats_headers(&self) -> csv::StringRecord {
+        let subtype_xsd = self
+            .flag_subtype
+            .as_ref()
+            .map_or(false, |s| s.to_lowercase().contains("xsd"));
+
         if self.flag_typesonly {
-            return csv::StringRecord::from(vec!["field", "type"]);
+            let mut fields = vec!["field", "type"];
+            if subtype_xsd {
+                fields.push("subtype_xsd");
+            }
+            return csv::StringRecord::from(fields);
         }
 
         // with --everything, we have MAX_STAT_COLUMNS columns at most
@@ -1782,6 +1824,11 @@ impl Args {
         fields.extend_from_slice(&[
             "field",
             "type",
+        ]);
+        if subtype_xsd {
+            fields.push("subtype_xsd");
+        }
+        fields.extend_from_slice(&[
             "is_ascii",
             "sum",
             "min",
@@ -1971,6 +2018,7 @@ struct WhichStats {
     typesonly:       bool,
     percentiles:     bool,
     percentile_list: String,
+    subtype_xsd:     bool,
 }
 
 impl Commute for WhichStats {
@@ -2177,7 +2225,7 @@ impl Stats {
         // and --range, so we need to add samples.
         // Early return for the uncommon typesonly case
         // Most of the time we're NOT doing typesonly, so put this check first
-        if self.which.typesonly && !infer_boolean {
+        if self.which.typesonly && !infer_boolean && !self.which.subtype_xsd {
             return;
         }
 
@@ -2348,6 +2396,33 @@ impl Stats {
     /// The function is optimized for performance with pre-allocated vectors and efficient
     /// string formatting. It reuses computed values (like median from quartiles) to avoid
     /// redundant calculations.
+    fn infer_subtype_xsd(&self) -> String {
+        match self.typ {
+            FieldType::TInteger => {
+                if let Some(mm) = &self.minmax {
+                    if let (Some(min), Some(max)) = (mm.integers.min(), mm.integers.max()) {
+                        if *min >= -128 && *max <= 127 {
+                            return "byte".to_string();
+                        }
+                        if *min >= -32_768 && *max <= 32_767 {
+                            return "short".to_string();
+                        }
+                        if *min >= -2_147_483_648 && *max <= 2_147_483_647 {
+                            return "int".to_string();
+                        }
+                        return "long".to_string();
+                    }
+                }
+                "integer".to_string()
+            },
+            FieldType::TFloat => "decimal".to_string(),
+            FieldType::TString => "string".to_string(),
+            FieldType::TDate => "date".to_string(),
+            FieldType::TDateTime => "dateTime".to_string(),
+            FieldType::TNull => String::new(),
+        }
+    }
+
     #[allow(clippy::wrong_self_convention)]
     pub fn to_record(
         &mut self,
@@ -2355,6 +2430,7 @@ impl Stats {
         infer_boolean: bool,
         visualize_ws: bool,
         dataset_stats: bool,
+        subtype_xsd: bool,
     ) -> csv::StringRecord {
         // empty string constant to avoid repeated allocations
         const EMPTY_STR: &str = "";
@@ -2362,7 +2438,11 @@ impl Stats {
 
         // we're doing typesonly and not inferring boolean, just return the type
         if self.which.typesonly && !infer_boolean {
-            return csv::StringRecord::from(vec![self.typ.to_string()]);
+            let mut fields = vec![self.typ.to_string()];
+            if subtype_xsd {
+                fields.push(self.infer_subtype_xsd());
+            }
+            return csv::StringRecord::from(fields);
         }
 
         let typ = self.typ;
@@ -2547,6 +2627,10 @@ impl Stats {
             }
         } else {
             record.push_field(typ.as_str());
+        }
+
+        if subtype_xsd {
+            record.push_field(&self.infer_subtype_xsd());
         }
 
         // we're doing --typesonly with --infer-boolean, we don't need to calculate anything else

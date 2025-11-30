@@ -2892,3 +2892,38 @@ fn stats_string_max_length() {
         "this_is_a_very_long_string_that_should_be_truncated"
     );
 }
+
+#[test]
+fn stats_subtype() {
+    let wrk = Workdir::new("stats_subtype");
+    wrk.create(
+        "data.csv",
+        vec![
+            svec!["byte", "short", "int", "long", "decimal", "string", "date", "datetime"],
+            svec!["127", "32767", "2147483647", "9223372036854775807", "1.1", "foo", "2021-01-01", "2021-01-01T12:00:00Z"],
+            svec!["-128", "-32768", "-2147483648", "-9223372036854775808", "2.2", "bar", "2021-01-02", "2021-01-02T12:00:00Z"],
+        ],
+    );
+
+    let mut cmd = wrk.command("stats");
+    cmd.arg("data.csv")
+        .arg("--subtype")
+        .arg("xsd")
+        .arg("--typesonly")
+        .arg("--infer-dates");
+
+    let got: Vec<Vec<String>> = wrk.read_stdout(&mut cmd);
+    let expected = vec![
+        svec!["field", "type", "subtype_xsd"],
+        svec!["byte", "Integer", "byte"],
+        svec!["short", "Integer", "short"],
+        svec!["int", "Integer", "int"],
+        svec!["long", "Integer", "long"],
+        svec!["decimal", "Float", "decimal"],
+        svec!["string", "String", "string"],
+        svec!["date", "Date", "date"],
+        svec!["datetime", "DateTime", "dateTime"],
+    ];
+
+    assert_eq!(got, expected);
+}

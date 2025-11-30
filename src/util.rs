@@ -2544,6 +2544,7 @@ pub fn get_stats_records(
             flag_memcheck:         args.flag_memcheck,
             flag_vis_whitespace:   false,
             flag_dataset_stats:    true,
+            flag_subtype:          None,
         };
 
         let tempfile = tempfile::Builder::new().suffix(".stats.csv").tempfile()?;
